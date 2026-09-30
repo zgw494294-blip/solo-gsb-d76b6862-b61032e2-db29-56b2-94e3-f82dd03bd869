@@ -9,9 +9,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .core import CalibrationError, infer_opacities, solve, suggest_background
+from .core import CalibrationError, infer_opacities, review_measurement, solve, suggest_background
 
-app = FastAPI(title="透明图层叠序校准台", version="1.2.0")
+app = FastAPI(title="透明图层叠序校准台", version="1.3.0")
 
 
 @app.get("/api/health")
@@ -62,6 +62,22 @@ async def api_suggest_background(request: Request) -> JSONResponse:
         )
     try:
         result = suggest_background(payload)
+    except CalibrationError as exc:
+        return JSONResponse(status_code=400, content={"errors": exc.errors})
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/review-measurement")
+async def api_review_measurement(request: Request) -> JSONResponse:
+    try:
+        payload: Any = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "form", "message": "请求体不是合法的 JSON"}]},
+        )
+    try:
+        result = review_measurement(payload)
     except CalibrationError as exc:
         return JSONResponse(status_code=400, content={"errors": exc.errors})
     return JSONResponse(status_code=200, content=result)

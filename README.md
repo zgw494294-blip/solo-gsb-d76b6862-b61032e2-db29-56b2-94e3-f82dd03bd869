@@ -1,6 +1,6 @@
 # 透明图层叠序校准台
 
-本地 Web 应用：录入若干个纯色半透明图层与多组「背景色 / 目标色」样本，自动枚举所有底 → 顶叠放顺序，找出对全部样本整体拟合最好的图层顺序；顺序确定后还可以**从目标色反推 1～2 个图层的建议不透明度**；当容差内仍存在多条难分的叠序时，可进一步给出**下一次背景测量建议**——从候选背景中挑出最能把这些顺序的预测色拉开差距的一个。
+本地 Web 应用：录入若干个纯色半透明图层与多组「背景色 / 目标色」样本，自动枚举所有底 → 顶叠放顺序，找出对全部样本整体拟合最好的图层顺序；顺序确定后还可以**从目标色反推 1～2 个图层的建议不透明度**；当容差内仍存在多条难分的叠序时，可进一步给出**下一次背景测量建议**——从候选背景中挑出最能把这些顺序的预测色拉开差距的一个；在该候选背景上拿到实测颜色后，还能做**实测颜色复核**——逐条复核容差内的全部叠序哪些仍与测量相符，旧样本不足 4 组时可把测量追加为样本并重新求解。
 
 - **后端**：Python + FastAPI（计算核心仅用标准库，便于审阅与测试）
 - **前端**：原生 HTML / CSS / JavaScript，无任何构建步骤与外部 CDN 依赖
@@ -33,6 +33,7 @@ http://localhost:8000
 | 结果 | 最终顺序（带半透明色点、底→顶方向）、总平方误差、枚举/可行排列数；每个样本并排显示目标色与预测色、HEX、RGB 与 R/G/B 分通道平方误差 |
 | 不透明度反推 | 顺序确定后，沿用当前图层、样本与先后关系：确认一条底→顶顺序并勾选 1～2 个待调图层，其余图层保留原不透明度。联合遍历待调图层 0.00～1.00、步长 0.01 的全部组合（原始参数组若落在网格外也额外纳入），按同一未取整 RGB 平方误差总和选最优；同分时按 **ID 字典序排列的待调参数元组从小到大** 决胜。页面展示原值 / 建议值、调整前后总误差、每组样本的目标色与调整前后预测色，可一键把建议值写回图层并重新求解 |
 | 下一次背景测量建议 | 沿用当前图层、样本与先后关系，录入 **2～12 个**规范化后互不重复的候选背景 HEX 与**非负有限**的误差容差：枚举合规叠序，保留总误差 ≤ 最优总误差 ＋ 容差的顺序，按（总误差、ID 序列）排序取前 12 条展示，并给出符合容差的总数；在每个候选背景上按同一线性光规则渲染这些顺序，以**任意两条预测色未取整 RGB（0–255）平方距离的最小值**给背景打分，推荐得分最高者（同分取规范化 HEX 字典序最小者），并展示推荐背景上最难区分的一对顺序及其预测色；容差内不足两条顺序时提示无需追加测量 |
+| 实测颜色复核 | 在建议区选定**一个候选背景**，录入该背景上的**实测目标 HEX** 与**非负有限的新测量误差上限**，沿用当前图层、旧样本、先后关系及建议容差：先保留旧样本总误差 ≤ 最优总误差 ＋ 容差的**全部**合规叠序（建议页只展示前 12 条，但复核逐条覆盖、不会漏），再以选定背景上**未取整 0～255 RGB** 与实测色计算平方误差，仅留下不超过新上限者；显示筛选前后总数，留下叠序展示旧总误差、新测量误差与预测色，按（新测量误差、旧总误差、ID 序列）排序取前 12 条；没有匹配时提示实测与现有候选不相容；有匹配且旧样本少于 4 组时，可把该测量（选定背景＋实测色）追加为第 N＋1 组样本并触发原求解。参与复核的任一输入变化（图层 / 旧样本 / 先后关系 / 候选背景 / 容差 / 选定背景 / 实测色 / 上限）或追加样本后，旧复核结果立即失效，不能再用于追加 |
 
 输入任意改动后自动重新求解（带防抖），非法颜色、重复 ID、越界不透明度等错误会在页面顶部以中文逐条列出，并暂停计算。反推与背景建议为手动触发；输入变化后，旧结果会在卡片内标记为「可能过期」。
 
@@ -215,6 +216,85 @@ curl -s -X POST http://localhost:8000/api/suggest-background \
 ] }
 ```
 
+### `POST /api/review-measurement` — 实测颜色复核
+
+在 `/api/suggest-background` 请求体的基础上增加三个复核字段（`candidateBackgrounds` / `tolerance` 仍沿用建议区的录入）：
+
+- `selectedBackground`：从候选背景中选定的**一个**背景 HEX（规范化后必须存在于 `candidateBackgrounds`）；
+- `measuredColor`：在该背景上测得的目标色 HEX（`#RGB` / `#RRGGBB`，`#` 可省略）；
+- `measurementLimit`：**非负有限**数字的新测量误差上限。
+
+服务端先枚举旧样本总误差 ≤ 最优总误差 ＋ 容差的**全部**合规叠序（不按前 12 条截断），再在选定背景上以未取整 0–255 RGB 与实测色计算平方误差，仅保留不超过 `measurementLimit` 的叠序；留下的叠序按（新测量误差、旧总误差、ID 序列字典序）排序，仅前 12 条进入 `orders`，但 `matchedCount` 是覆盖全部叠序筛选后的真实总数。
+
+```bash
+curl -s -X POST http://localhost:8000/api/review-measurement \
+  -H "Content-Type: application/json" \
+  -d '{
+    "layers": [
+      { "id": "R", "color": "#ff0000", "opacity": 0.5 },
+      { "id": "B", "color": "#0000ff", "opacity": 0.5 }
+    ],
+    "samples": [
+      { "background": "#ffffff", "target": "#e189bc" }
+    ],
+    "relations": [],
+    "candidateBackgrounds": ["#ffffff", "#000000", "#808080"],
+    "tolerance": 10000,
+    "selectedBackground": "#ffffff",
+    "measuredColor": "#e289bb",
+    "measurementLimit": 5
+  }'
+```
+
+成功返回：
+
+```json
+{
+  "tolerance": 10000.0,
+  "measurementLimit": 5.0,
+  "selectedBackground": "#ffffff",
+  "measuredColor": "#e289bb",
+  "bestSse": 0.3876,
+  "feasibleCount": 2,
+  "withinCount": 2,
+  "matchedCount": 1,
+  "compatible": true,
+  "shownCount": 1,
+  "orders": [
+    {
+      "order": ["B", "R"],
+      "orderIndexes": [1, 0],
+      "oldTotalSse": 0.3876,
+      "measurementSse": 0.4521,
+      "predictedRgb": [224.61, 136.96, 187.52],
+      "predictedHex": "#e189bc",
+      "channelSse": [0.15, 0.0, 0.30]
+    }
+  ],
+  "sampleCount": 1,
+  "canAppendSample": true
+}
+```
+
+说明：
+
+- `feasibleCount` 为满足先后关系的叠序总数，`withinCount` 为其中旧总误差 ≤ 最优总误差 ＋ 容差者（**筛选前**），`matchedCount` 为再按新测量误差上限筛选后的数量（**筛选后**）；`orders` 只有排序后的前 12 条，`shownCount` 为本次实际返回条数。
+- 每条结果给出 `oldTotalSse`（旧样本总误差，与 `/api/solve` 的 `totalSse` 同口径）、`measurementSse`（选定背景上未取整 RGB 对实测色的平方误差）、`predictedRgb`（0–255 浮点）与取整展示用 `predictedHex`。
+- `compatible` 为 `false`（即 `matchedCount = 0`）时，`orders` 为空，表示实测色与现有候选不相容。
+- `canAppendSample`：有匹配且旧样本少于 4 组时为 `true`。追加样本由客户端完成——把 `{ "background": selectedBackground, "target": measuredColor }` 加入 `samples` 后重新调用 `/api/solve` 即「触发原求解」；追加后旧复核结果立即失效，不能再用同一次结果重复追加。
+- 典型 400 报错（新增错误的 `scope` 为 `review`，容差等沿用 `tolerance` 等原 scope）：
+
+```json
+{ "errors": [
+  { "scope": "review", "message": "请从候选背景中选择一个用于复核的背景" },
+  { "scope": "review", "message": "选定的复核背景 #123456 不在候选背景列表中，请先在建议区选择一个候选背景" },
+  { "scope": "review", "message": "选定的复核背景色非法：需要形如 #RRGGBB 的 HEX 值，实际为 'zzz'" },
+  { "scope": "review", "message": "实测目标色非法：需要形如 #RRGGBB 的 HEX 值，实际为 '#gg0000'" },
+  { "scope": "review", "message": "新测量误差上限不能为负：-1" },
+  { "scope": "review", "message": "新测量误差上限必须是非负有限的数字，实际为 'abc'" }
+] }
+```
+
 ## 不用 Docker 的本地运行方式（可选）
 
 ```bash
@@ -232,8 +312,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 .
 ├── app/
 │   ├── __init__.py
-│   ├── core.py        # sRGB 转换 / alpha 合成 / 环检测 / 枚举择优 / 不透明度反推 / 背景测量建议（纯标准库）
-│   └── main.py        # FastAPI：/api/solve、/api/infer-opacity、/api/suggest-background 与静态页面托管
+│   ├── core.py        # sRGB 转换 / alpha 合成 / 环检测 / 枚举择优 / 不透明度反推 / 背景测量建议 / 实测颜色复核（纯标准库）
+│   └── main.py        # FastAPI：/api/solve、/api/infer-opacity、/api/suggest-background、/api/review-measurement 与静态页面托管
 ├── static/
 │   ├── index.html
 │   ├── styles.css

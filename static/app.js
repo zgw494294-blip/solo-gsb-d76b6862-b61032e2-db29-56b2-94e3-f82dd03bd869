@@ -55,6 +55,7 @@ function scheduleSolve(delay = 200) {
   solveTimer = setTimeout(runSolve, delay);
   markInferStaleness();
   markSuggestStaleness();
+  markReviewStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -256,17 +257,46 @@ document.addEventListener("input", (e) => {
       syncPicker(t, "suggest-picker", i, t.value);
       refreshSuggestCandValidity();
       markSuggestStaleness();
+      renderReviewBgOptions();
+      markReviewStaleness();
       break;
     case "suggest-picker":
       suggestState.candidates[i] = t.value.toLowerCase();
       syncTextInput("suggest-hex", i, t.value.toLowerCase());
       refreshSuggestCandValidity();
       markSuggestStaleness();
+      renderReviewBgOptions();
+      markReviewStaleness();
       break;
     case "suggest-tolerance": {
       const v = parseFloat(t.value);
       suggestState.tolerance = Number.isNaN(v) ? t.value : v;
       markSuggestStaleness();
+      markReviewStaleness();
+      break;
+    }
+    case "review-color":
+      reviewState.measuredColor = t.value;
+      {
+        const hx = normalizeHex(t.value);
+        if (hx) $("#reviewPicker").value = hx;
+      }
+      t.classList.toggle("invalid", normalizeHex(t.value) === null);
+      markReviewStaleness();
+      break;
+    case "review-picker":
+      reviewState.measuredColor = t.value.toLowerCase();
+      {
+        const colorInput = $("#reviewColor");
+        colorInput.value = t.value.toLowerCase();
+        colorInput.classList.remove("invalid");
+      }
+      markReviewStaleness();
+      break;
+    case "review-limit": {
+      const v = parseFloat(t.value);
+      reviewState.measurementLimit = Number.isNaN(v) ? t.value : v;
+      markReviewStaleness();
       break;
     }
   }
@@ -348,10 +378,14 @@ document.addEventListener("click", (e) => {
     suggestState.candidates.push("#808080");
     renderSuggestControls();
     markSuggestStaleness();
+    renderReviewBgOptions();
+    markReviewStaleness();
   } else if (act === "suggest-remove" && suggestState.candidates.length > MIN_CANDIDATES) {
     suggestState.candidates.splice(i, 1);
     renderSuggestControls();
     markSuggestStaleness();
+    renderReviewBgOptions();
+    markReviewStaleness();
   }
 });
 
@@ -472,6 +506,8 @@ function renderResult(r) {
   `;
   elResultBody.innerHTML = body;
   $("#suggestCard").hidden = false;
+  $("#reviewCard").hidden = false;
+  renderReviewBgOptions();
   syncInferPanel(r);
 }
 
@@ -704,6 +740,9 @@ document.addEventListener("change", (e) => {
     if (t.checked) inferState.picks.add(id);
     else inferState.picks.delete(id);
     renderInferControls();
+  } else if (act === "review-bg") {
+    reviewState.selectedBackground = t.value;
+    markReviewStaleness();
   }
 });
 
@@ -721,6 +760,8 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "infer-run") runInfer();
   if (btn.dataset.act === "infer-apply") applyInferResult();
   if (btn.dataset.act === "suggest-run") runSuggest();
+  if (btn.dataset.act === "review-run") runReview();
+  if (btn.dataset.act === "review-append") appendReviewSample();
 });
 
 async function runInfer() {
@@ -1059,7 +1100,209 @@ function suggestPairCell(side) {
     </div>`;
 }
 
+// ====================================================== 实测颜色复核 ==
+
+const reviewState = {
+  selectedBackground: "",   // 选定的候选背景规范化 HEX
+  measuredColor: "#808080", // 实测目标色（按录入原样保存，提交时由后端校验）
+  measurementLimit: 1,      // 新测量误差上限（非负有限；非法原样交后端报错）
+  result: null,             // 最近一次成功返回
+  resultKey: "",            // 结果产生时的输入指纹
+};
+
+const elReviewResult = $("#reviewResult");
+const elReviewErrors = $("#reviewErrors");
+const elReviewStatus = $("#reviewStatus");
+const elReviewBgSelect = $("#reviewBgSelect");
+
+function reviewSignature() {
+  // 用于判断已有复核结果是否对应当前输入
+  return JSON.stringify({
+    layers: state.layers,
+    samples: state.samples,
+    relations: state.relations,
+    candidates: suggestState.candidates,
+    tolerance: suggestState.tolerance,
+    selectedBackground: reviewState.selectedBackground,
+    measuredColor: reviewState.measuredColor,
+    measurementLimit: reviewState.measurementLimit,
+  });
+}
+
+// 复核下拉只列候选背景中规范化后合法且不重复的 HEX
+function validReviewCandidates() {
+  const seen = new Set();
+  const out = [];
+  suggestState.candidates.forEach((raw) => {
+    const hx = normalizeHex(raw);
+    if (hx && !seen.has(hx)) {
+      seen.add(hx);
+      out.push(hx);
+    }
+  });
+  return out;
+}
+
+function renderReviewBgOptions() {
+  const options = validReviewCandidates();
+  if (!options.includes(reviewState.selectedBackground)) {
+    reviewState.selectedBackground = options[0] || "";
+  }
+  elReviewBgSelect.innerHTML = options.length
+    ? options.map((hx) => `<option value="${hx}">${hx}</option>`).join("")
+    : '<option value="">（候选背景均非法，请先修正上方候选）</option>';
+  elReviewBgSelect.value = reviewState.selectedBackground;
+}
+
+function markReviewStaleness() {
+  if (!reviewState.result) return;
+  const fresh = reviewSignature() === reviewState.resultKey;
+  const old = elReviewResult.querySelector(".stale-note");
+  if (!fresh && !old) {
+    const note = document.createElement("div");
+    note.className = "stale-note";
+    note.textContent = "参与复核的输入已变化，以下复核结果已失效，请重新复核（旧结果不能再用于追加样本）。";
+    elReviewResult.prepend(note);
+  } else if (fresh && old) {
+    old.remove();
+  }
+  // 追加按钮的可用状态随失效状态同步
+  const appendBtn = elReviewResult.querySelector('button[data-act="review-append"]');
+  if (appendBtn) {
+    const canAppend = fresh && reviewState.result.canAppendSample;
+    appendBtn.disabled = !canAppend;
+  }
+}
+
+function reviewResultFresh() {
+  if (!reviewState.result) return false;
+  return reviewSignature() === reviewState.resultKey;
+}
+
+async function runReview() {
+  const payload = {
+    layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
+    samples: state.samples.map((s) => ({ background: s.background, target: s.target })),
+    relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
+    candidateBackgrounds: [...suggestState.candidates],
+    tolerance: suggestState.tolerance,
+    selectedBackground: reviewState.selectedBackground,
+    measuredColor: reviewState.measuredColor,
+    measurementLimit: reviewState.measurementLimit,
+  };
+  elReviewStatus.textContent = "复核中…";
+  elReviewStatus.className = "status busy";
+  elReviewErrors.hidden = true;
+
+  try {
+    const resp = await fetch("/api/review-measurement", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    elReviewStatus.textContent = "";
+    elReviewStatus.className = "status";
+    if (!resp.ok) {
+      showReviewErrors(data.errors || [{ scope: "form", message: "复核失败" }]);
+      return;
+    }
+    reviewState.result = data;
+    reviewState.resultKey = reviewSignature();
+    renderReviewResult(data);
+  } catch (err) {
+    elReviewStatus.textContent = "";
+    elReviewStatus.className = "status";
+    showReviewErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
+}
+
+function showReviewErrors(errors) {
+  elReviewErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elReviewErrors.hidden = false;
+}
+
+function renderReviewResult(r) {
+  const fresh = reviewResultFresh();
+  let html = `
+    <div class="metric-row">
+      <span>复核背景：<b>${r.selectedBackground}</b></span>
+      <span>实测目标色：<b class="hexval">${r.measuredColor}</b></span>
+      <span>新测量误差上限：<b>${fmtSse(r.measurementLimit)}</b></span>
+      <span>建议容差：<b>${fmtSse(r.tolerance)}</b></span>
+    </div>
+    <div class="metric-row">
+      <span>合规叠序：<b>${r.feasibleCount}</b> 条</span>
+      <span>容差内（筛选前）：<b>${r.withinCount}</b> 条</span>
+      <span>新测量上限内（筛选后）：<b>${r.matchedCount}</b> 条</span>
+      <span>按新测量误差、旧总误差、ID 序列排序，展示前 <b>${r.shownCount}</b> 条
+        （筛选覆盖全部 ${r.withinCount} 条，未因展示截断而漏检）</span>
+    </div>
+  `;
+
+  if (!r.compatible) {
+    html += `
+      <div class="review-incompat">
+        实测色 ${r.measuredColor} 在背景 ${r.selectedBackground} 上与现有候选不相容：
+        容差内的 ${r.withinCount} 条叠序在该背景上的预测色，新测量误差均超过上限
+        ${fmtSse(r.measurementLimit)}。请检查实测颜色 / 误差上限 / 候选背景，或调整图层与旧样本。
+      </div>`;
+    elReviewResult.innerHTML = html;
+    return;
+  }
+
+  const orderRows = r.orders
+    .map((o, k) => {
+      const rgbTxt = o.predictedRgb.map((v) => Math.round(v)).join(", ");
+      return `
+        <div class="review-order-row">
+          <span class="row-index">${k + 1}</span>
+          <span class="mini" style="background:${o.predictedHex}"></span>
+          <span class="review-order-ids">${o.order.map(escapeHtml).join(" ↑ ")}</span>
+          <span class="hint">旧总误差 ${fmtSse(o.oldTotalSse)}</span>
+          <span class="review-meas">新测量误差 <b>${fmtSse(o.measurementSse)}</b></span>
+          <span class="spacer"></span>
+          <span class="hexval">${o.predictedHex}</span>
+          <span class="hint">rgb(${rgbTxt})</span>
+        </div>`;
+    })
+    .join("");
+  html += `<div class="review-orders">${orderRows}</div>`;
+
+  if (r.canAppendSample) {
+    html += `
+      <div class="review-append-row">
+        <button class="btn btn-small" data-act="review-append" type="button"
+                ${fresh ? "" : "disabled"}>把本次测量追加为第 ${r.sampleCount + 1} 组样本并重新求解</button>
+        <span class="hint">当前 ${r.sampleCount} 组旧样本（少于 4 组）；追加后旧复核结果即失效</span>
+      </div>`;
+  } else {
+    html += `
+      <div class="hint review-append-row">
+        旧样本已有 ${r.sampleCount} 组（上限 4 组），不能再追加；如需纳入本次测量，请先在左侧样本区替换或删除一组。
+      </div>`;
+  }
+
+  elReviewResult.innerHTML = html;
+  if (!fresh) markReviewStaleness();
+}
+
+function appendReviewSample() {
+  const r = reviewState.result;
+  if (!r || !reviewResultFresh() || !r.canAppendSample) return;
+  // 以「选定候选背景 + 实测目标色」追加为一组新样本，随后触发原求解；
+  // 追加即输入变化，复核与建议结果一并失效，不能再用于下一次追加。
+  state.samples.push({ background: r.selectedBackground, target: r.measuredColor });
+  render();
+  markSuggestStaleness();
+  renderSuggestControls();
+  markReviewStaleness();
+  runSolve();
+}
+
 // ------------------------------------------------------------ 启动 --
 render();
 renderSuggestControls();
+renderReviewBgOptions();
 runSolve();

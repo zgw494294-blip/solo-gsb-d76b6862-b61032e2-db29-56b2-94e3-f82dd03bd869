@@ -7,6 +7,8 @@
 - 图层顺序确定后，可在 0.00～1.00（步长 0.01）网格上联合反推 1～2 个图层的不透明度
 - 下一次背景测量建议：保留总误差不高于最优总误差 + 容差的叠序，
   在候选背景上渲染后以「任意两条预测色未取整 RGB 平方距离最小值」打分并推荐
+- 实测颜色复核：在选定候选背景上拿到实测色后，对容差内的全部叠序（不止建议页
+  展示的前 12 条）计算该背景上的未取整 RGB 平方误差，留下不超过新测量上限者
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ MIN_ADJUST = 1
 MIN_CANDIDATES = 2
 MAX_CANDIDATES = 12
 MAX_SUGGEST_ORDERS = 12
+MAX_REVIEW_ORDERS = 12
 
 
 class CalibrationError(Exception):
@@ -366,6 +369,44 @@ def _sample_details(
 # ------------------------------------------------------------------- 求解 --
 
 
+def _feasible_perms(
+    n: int, pairs: list[tuple[int, int]]
+) -> list[tuple[int, ...]]:
+    """枚举满足全部先后关系（lower 在 upper 下方）的底→顶排列。"""
+    def feasible(perm: tuple[int, ...]) -> bool:
+        pos = [0] * n
+        for p, idx in enumerate(perm):
+            pos[idx] = p
+        return all(pos[li] < pos[ui] for li, ui in pairs)
+
+    return [perm for perm in itertools.permutations(range(n)) if feasible(perm)]
+
+
+def _orders_within_tolerance(
+    parsed: _Parsed, tolerance: float
+) -> tuple[list[tuple[float, tuple[str, ...], tuple[int, ...]]], float, list[tuple[int, ...]]]:
+    """枚举全部合规叠序，返回 (旧总误差 ≤ 最优旧总误差 + 容差的叠序, 最优旧总误差, 全部合规排列)。
+
+    返回列表已按（旧总误差、ID 序列）排序；旧总误差走 _total_sse（0–255
+    未取整平方误差总和），与 solve/建议页同一口径。
+    """
+    perms = _feasible_perms(len(parsed.ids), parsed.pairs)
+    evaluated: list[tuple[float, tuple[str, ...], tuple[int, ...]]] = []
+    best_sse = math.inf
+    for perm in perms:
+        sse = _total_sse(parsed, list(perm), parsed.alphas)
+        best_sse = min(best_sse, sse)
+        evaluated.append((sse, tuple(parsed.ids[idx] for idx in perm), perm))
+
+    limit = best_sse + tolerance
+    kept = [e for e in evaluated if e[0] <= limit]
+    kept.sort(key=lambda e: (e[0], e[1]))
+    return kept, best_sse, perms
+
+
+# ------------------------------------------------------------------- 求解 --
+
+
 def solve(payload: Any) -> dict[str, Any]:
     parsed, errors = _parse_inputs(payload)
     if errors:
@@ -580,20 +621,10 @@ def infer_opacities(payload: Any) -> dict[str, Any]:
 # --------------------------------------------------------- 背景测量建议 --
 
 
-def suggest_background(payload: Any) -> dict[str, Any]:
-    """下一次背景测量建议。
-
-    沿用当前图层、样本与先后关系：枚举合规叠序，保留总误差不高于
-    最优总误差 + 容差的顺序（按总误差、ID 序列排序取前 12 条），再在每个
-    候选背景上按现有线性光规则渲染这些顺序，以任意两条预测色未取整
-    RGB（0–255 尺度）平方距离的最小值给背景打分；推荐得分最高者，
-    同分取规范化 HEX 字典序最小者。容差内不足两条顺序时无需追加测量。
-    """
-    parsed, errors = _parse_inputs(payload)
-    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
-
-    # ---- 候选背景 ---------------------------------------------------------
-    raw_candidates = payload.get("candidateBackgrounds")
+def _parse_candidate_backgrounds(
+    raw_candidates: Any, errors: list[dict[str, Any]]
+) -> tuple[list[str], list[tuple[float, float, float]]]:
+    """解析 2～12 个规范化后互不重复的候选背景 HEX，非法/重复记入 errors。"""
     if not isinstance(raw_candidates, list):
         errors.append(_err("candidates", "缺少 candidateBackgrounds 列表或其格式不正确"))
         raw_candidates = []
@@ -624,44 +655,49 @@ def suggest_background(payload: Any) -> dict[str, Any]:
         seen_cand[norm] = i
         cand_hex.append(norm)
         cand_srgb.append(rgb)
+    return cand_hex, cand_srgb
+
+
+def _parse_nonneg_number(
+    raw: Any, scope: str, label: str, errors: list[dict[str, Any]]
+) -> tuple[float, bool]:
+    """解析非负有限数字，非法/为负时把中文错误写入 errors。label 为字段中文名。"""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        errors.append(_err(scope, f"{label}必须是非负有限的数字，实际为 {raw!r}"))
+        return 0.0, False
+    if raw < 0:
+        errors.append(_err(scope, f"{label}不能为负：{raw}"))
+        return 0.0, False
+    return float(raw), True
+
+
+def suggest_background(payload: Any) -> dict[str, Any]:
+    """下一次背景测量建议。
+
+    沿用当前图层、样本与先后关系：枚举合规叠序，保留总误差不高于
+    最优总误差 + 容差的顺序（按总误差、ID 序列排序取前 12 条），再在每个
+    候选背景上按现有线性光规则渲染这些顺序，以任意两条预测色未取整
+    RGB（0–255 尺度）平方距离的最小值给背景打分；推荐得分最高者，
+    同分取规范化 HEX 字典序最小者。容差内不足两条顺序时无需追加测量。
+    """
+    parsed, errors = _parse_inputs(payload)
+    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
+
+    # ---- 候选背景 ---------------------------------------------------------
+    cand_hex, cand_srgb = _parse_candidate_backgrounds(
+        payload.get("candidateBackgrounds"), errors
+    )
 
     # ---- 误差容差 ----------------------------------------------------------
-    raw_tol = payload.get("tolerance")
-    tolerance = 0.0
-    if isinstance(raw_tol, bool) or not isinstance(raw_tol, (int, float)) or not math.isfinite(raw_tol):
-        errors.append(_err("tolerance", f"误差容差必须是非负有限的数字，实际为 {raw_tol!r}"))
-    elif raw_tol < 0:
-        errors.append(_err("tolerance", f"误差容差不能为负：{raw_tol}"))
-    else:
-        tolerance = float(raw_tol)
+    tolerance, _ = _parse_nonneg_number(payload.get("tolerance"), "tolerance", "误差容差", errors)
 
     if errors:
         raise CalibrationError(errors)
     _raise_if_cycle(parsed)
 
-    n = len(parsed.ids)
-    pairs = parsed.pairs
-
-    def feasible(perm: tuple[int, ...]) -> bool:
-        pos = [0] * n
-        for p, idx in enumerate(perm):
-            pos[idx] = p
-        return all(pos[li] < pos[ui] for li, ui in pairs)
-
     # ---- 枚举合规叠序，按容差保留 ------------------------------------------
-    evaluated: list[tuple[float, tuple[str, ...], tuple[int, ...]]] = []
-    best_sse = math.inf
-    for perm in itertools.permutations(range(n)):
-        if not feasible(perm):
-            continue
-        sse = _total_sse(parsed, list(perm), parsed.alphas)
-        best_sse = min(best_sse, sse)
-        evaluated.append((sse, tuple(parsed.ids[idx] for idx in perm), perm))
-
-    feasible_count = len(evaluated)
-    limit = best_sse + tolerance
-    kept = [e for e in evaluated if e[0] <= limit]
-    kept.sort(key=lambda e: (e[0], e[1]))
+    kept, _, all_feasible = _orders_within_tolerance(parsed, tolerance)
+    feasible_count = len(all_feasible)
     within_count = len(kept)
     top = kept[:MAX_SUGGEST_ORDERS]
 
@@ -679,7 +715,7 @@ def suggest_background(payload: Any) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "tolerance": tolerance,
-        "bestSse": orders[0]["totalSse"] if orders else best_sse,
+        "bestSse": orders[0]["totalSse"] if orders else 0.0,
         "feasibleCount": feasible_count,
         "withinCount": within_count,
         "orders": orders,
@@ -738,3 +774,140 @@ def suggest_background(payload: Any) -> dict[str, Any]:
 
     result["recommended"] = recommended
     return result
+
+
+# ----------------------------------------------------------- 实测颜色复核 --
+
+
+def review_measurement(payload: Any) -> dict[str, Any]:
+    """候选背景上的实测颜色复核。
+
+    沿用当前图层、旧样本、先后关系及建议容差：先枚举旧样本总误差不高于
+    最优值 + 容差的全部合规叠序（建议页只展示前 12 条，但这里一条不漏），
+    再在选定候选背景上以未取整 0～255 RGB 与实测色计算平方误差，仅留下
+    不超过新测量误差上限的叠序；结果按（新测量误差、旧总误差、ID 序列）
+    排序后展示前 12 条，并给出筛选前后总数。
+    """
+    parsed, errors = _parse_inputs(payload)
+    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
+
+    # ---- 候选背景（沿用建议页录入，复核只需选定其中一个）-------------------
+    cand_hex, _cand_srgb = _parse_candidate_backgrounds(
+        payload.get("candidateBackgrounds"), errors
+    )
+    cand_set = set(cand_hex)
+
+    raw_selected = payload.get("selectedBackground")
+    selected_norm = ""
+    selected_srgb: tuple[float, float, float] | None = None
+    if not isinstance(raw_selected, str) or not raw_selected.strip():
+        errors.append(_err("review", "请从候选背景中选择一个用于复核的背景"))
+    else:
+        try:
+            selected_norm, selected_rgb = parse_hex(raw_selected)
+        except ValueError:
+            errors.append(
+                _err(
+                    "review",
+                    f"选定的复核背景色非法：需要形如 #RRGGBB 的 HEX 值，实际为 {raw_selected!r}",
+                )
+            )
+        else:
+            if selected_norm not in cand_set:
+                errors.append(
+                    _err(
+                        "review",
+                        f"选定的复核背景 {selected_norm} 不在候选背景列表中，请先在建议区选择一个候选背景",
+                    )
+                )
+            else:
+                selected_srgb = selected_rgb
+
+    # ---- 实测目标色 -------------------------------------------------------
+    raw_measured = payload.get("measuredColor")
+    measured_norm = ""
+    measured_srgb: tuple[float, float, float] | None = None
+    if not isinstance(raw_measured, str) or not raw_measured.strip():
+        errors.append(
+            _err(
+                "review",
+                f"实测目标色非法：需要形如 #RRGGBB 的 HEX 值，实际为 {raw_measured!r}",
+            )
+        )
+    else:
+        try:
+            measured_norm, measured_srgb = parse_hex(raw_measured)
+        except ValueError:
+            errors.append(
+                _err(
+                    "review",
+                    f"实测目标色非法：需要形如 #RRGGBB 的 HEX 值，实际为 {raw_measured!r}",
+                )
+            )
+
+    # ---- 沿用建议容差 / 新测量误差上限 -------------------------------------
+    tolerance, _ = _parse_nonneg_number(payload.get("tolerance"), "tolerance", "误差容差", errors)
+    measure_limit, limit_ok = _parse_nonneg_number(
+        payload.get("measurementLimit"), "review", "新测量误差上限", errors
+    )
+
+    if errors:
+        raise CalibrationError(errors)
+    _raise_if_cycle(parsed)
+    assert selected_srgb is not None and measured_srgb is not None and limit_ok
+
+    # ---- 容差内的全部合规叠序（不截断为前 12 条，复核必须逐条参与）--------
+    kept, _, all_feasible = _orders_within_tolerance(parsed, tolerance)
+    feasible_count = len(all_feasible)
+    within_count = len(kept)
+
+    # ---- 在选定背景上渲染并按新测量误差上限筛选 ----------------------------
+    measured255 = (
+        measured_srgb[0] * 255.0,
+        measured_srgb[1] * 255.0,
+        measured_srgb[2] * 255.0,
+    )
+    matched: list[dict[str, Any]] = []
+    for _raw_sse, id_seq, perm in kept:
+        pred = render_stack(selected_srgb, list(perm), parsed.lins, parsed.alphas)
+        pred255 = [_clamp01(pred[c]) * 255.0 for c in range(3)]
+        channel_sse = [(pred255[c] - measured255[c]) ** 2 for c in range(3)]
+        measure_sse = sum(channel_sse)
+        if measure_sse > measure_limit:
+            continue
+        rounded = [max(0, min(255, int(round(v)))) for v in pred255]
+        # 展示用旧总误差走 _sample_details，与 /api/solve、建议页逐位一致
+        _, display_old_sse = _sample_details(parsed, list(perm), parsed.alphas)
+        matched.append(
+            {
+                "order": list(id_seq),
+                "orderIndexes": list(perm),
+                "oldTotalSse": display_old_sse,
+                "measurementSse": measure_sse,
+                "predictedRgb": pred255,
+                "predictedHex": "#{:02x}{:02x}{:02x}".format(*rounded),
+                "channelSse": channel_sse,
+            }
+        )
+
+    matched.sort(key=lambda o: (o["measurementSse"], o["oldTotalSse"], tuple(o["order"])))
+    matched_count = len(matched)
+
+    # 最优旧总误差：kept 已按（旧总误差、ID 序列）排序，取第一条的展示口径即可
+    _, best_sse = _sample_details(parsed, list(kept[0][2]), parsed.alphas)
+
+    return {
+        "tolerance": tolerance,
+        "measurementLimit": measure_limit,
+        "selectedBackground": selected_norm,
+        "measuredColor": measured_norm,
+        "bestSse": best_sse,
+        "feasibleCount": feasible_count,
+        "withinCount": within_count,
+        "matchedCount": matched_count,
+        "compatible": matched_count > 0,
+        "shownCount": min(matched_count, MAX_REVIEW_ORDERS),
+        "orders": matched[:MAX_REVIEW_ORDERS],
+        "sampleCount": len(parsed.bg_hex),
+        "canAppendSample": matched_count > 0 and len(parsed.bg_hex) < MAX_SAMPLES,
+    }

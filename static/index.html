@@ -94,6 +94,38 @@
         </div>
       </div>
 
+      <!-- 实测颜色复核 -->
+      <div class="card review-card" id="reviewCard" hidden>
+        <div class="card-head">
+          <h2>实测颜色复核 <span class="hint">（拿到候选背景上的实测色后，逐条复核容差内叠序）</span></h2>
+          <span id="reviewStatus" class="status"></span>
+        </div>
+        <div id="reviewBody">
+          <div class="infer-field">
+            <div class="infer-field-label">复核背景（从上方建议区的候选背景中选一个）</div>
+            <select id="reviewBgSelect" data-act="review-bg"></select>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">实测目标色 HEX（#RGB / #RRGGBB，# 可省略）</div>
+            <input type="color" id="reviewPicker" data-act="review-picker" value="#808080" title="选色" />
+            <input id="reviewColor" data-act="review-color" type="text" value="#808080"
+                   placeholder="#RRGGBB" />
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">新测量误差上限（非负有限；保留该背景上平方误差不超过上限的叠序）</div>
+            <input id="reviewLimit" data-act="review-limit" type="number"
+                   min="0" step="any" value="1" />
+          </div>
+          <div class="infer-actions">
+            <button id="reviewRunBtn" class="btn btn-small" data-act="review-run"
+                    type="button">复核叠序</button>
+            <span id="reviewHint" class="hint">沿用当前图层、旧样本、先后关系与建议容差</span>
+          </div>
+          <div id="reviewErrors" class="infer-errors" hidden></div>
+          <div id="reviewResult"></div>
+        </div>
+      </div>
+
       <!-- 不透明度反推 -->
       <div class="card infer-card" id="inferCard" hidden>
         <div class="card-head">
