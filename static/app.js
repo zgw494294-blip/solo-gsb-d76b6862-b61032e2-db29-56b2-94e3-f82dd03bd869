@@ -55,6 +55,7 @@ function scheduleSolve(delay = 200) {
   solveTimer = setTimeout(runSolve, delay);
   markInferStaleness();
   markSuggestStaleness();
+  markVerifyStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -267,6 +268,27 @@ document.addEventListener("input", (e) => {
       const v = parseFloat(t.value);
       suggestState.tolerance = Number.isNaN(v) ? t.value : v;
       markSuggestStaleness();
+      markVerifyStaleness(); // 复核沿用该容差，容差变化同样使旧复核失效
+      break;
+    }
+    case "verify-hex":
+      verifyState.measured = t.value;
+      {
+        const hx = normalizeHex(t.value);
+        if (hx) $("#verifyPicker").value = hx;
+      }
+      t.classList.toggle("invalid", normalizeHex(t.value) === null);
+      markVerifyStaleness();
+      break;
+    case "verify-picker":
+      verifyState.measured = t.value.toLowerCase();
+      syncVerifyHex(t.value.toLowerCase());
+      markVerifyStaleness();
+      break;
+    case "verify-bound": {
+      const v = parseFloat(t.value);
+      verifyState.bound = Number.isNaN(v) ? t.value : v;
+      markVerifyStaleness();
       break;
     }
   }
@@ -704,6 +726,9 @@ document.addEventListener("change", (e) => {
     if (t.checked) inferState.picks.add(id);
     else inferState.picks.delete(id);
     renderInferControls();
+  } else if (act === "verify-bg") {
+    verifyState.background = t.value;
+    markVerifyStaleness();
   }
 });
 
@@ -721,6 +746,8 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "infer-run") runInfer();
   if (btn.dataset.act === "infer-apply") applyInferResult();
   if (btn.dataset.act === "suggest-run") runSuggest();
+  if (btn.dataset.act === "verify-run") runVerify();
+  if (btn.dataset.act === "verify-append") appendVerifySample();
 });
 
 async function runInfer() {
@@ -968,6 +995,9 @@ async function runSuggest() {
     suggestState.result = data;
     suggestState.resultKey = suggestSignature();
     renderSuggestResult(data);
+    syncVerifyBackgrounds(data);
+    // 建议重算后，基于旧建议的复核结果失效
+    markVerifyStaleness();
   } catch (err) {
     elSuggestStatus.textContent = "";
     elSuggestStatus.className = "status";
@@ -1059,7 +1089,237 @@ function suggestPairCell(side) {
     </div>`;
 }
 
+// ================================================================ 实测复核 ==
+
+const verifyState = {
+  background: "",     // 选定的候选背景（规范化 HEX；由建议结果候选列表同步）
+  measured: "#808080",// 实测目标色（按录入原样保存，提交时由后端规范化校验）
+  bound: 25,          // 新测量误差上限（非负有限；非法输入保留原样交后端报错）
+  result: null,       // 最近一次成功返回
+  resultKey: "",      // 结果产生时的输入指纹
+  appendedSig: "",    // 上次追加样本后的复核输入指纹（样本已变，旧结果不可再用于追加）
+  appended: false,    // 当前结果是否已追加为样本
+};
+
+const elVerifyCard = $("#verifyCard");
+const elVerifyBgSelect = $("#verifyBgSelect");
+const elVerifyResult = $("#verifyResult");
+const elVerifyErrors = $("#verifyErrors");
+const elVerifyStatus = $("#verifyStatus");
+const elVerifyHint = $("#verifyHint");
+
+function verifySignature() {
+  // 复核结果的输入指纹：参与复核的图层 / 旧样本 / 关系 / 建议容差 / 复核输入
+  return JSON.stringify({
+    layers: state.layers,
+    samples: state.samples,
+    relations: state.relations,
+    tolerance: suggestState.tolerance,
+    background: verifyState.background,
+    measured: verifyState.measured,
+    bound: verifyState.bound,
+  });
+}
+
+function syncVerifyHex(value) {
+  const el = $("#verifyHex");
+  if (el && el.value !== value) {
+    el.value = value;
+    el.classList.remove("invalid");
+  }
+}
+
+// 建议结果变化后，用候选背景重建下拉框：默认选推荐背景，并显示复核卡片
+function syncVerifyBackgrounds(suggestResult) {
+  elVerifyCard.hidden = false;
+  const candidates = (suggestResult.candidates || []).map((c) => c.hex);
+  const recommended = suggestResult.recommended ? suggestResult.recommended.hex : "";
+  elVerifyBgSelect.innerHTML = candidates
+    .map(
+      (hx) =>
+        `<option value="${hx}"${hx === recommended ? " selected" : ""}>${hx}</option>`
+    )
+    .join("");
+  if (candidates.length) {
+    verifyState.background =
+      candidates.includes(verifyState.background) ? verifyState.background : recommended || candidates[0];
+    elVerifyBgSelect.value = verifyState.background;
+  } else {
+    verifyState.background = "";
+  }
+  updateVerifyRunHint();
+}
+
+function updateVerifyRunHint() {
+  const btn = $("#verifyRunBtn");
+  btn.disabled = !verifyState.background;
+  if (!verifyState.background) {
+    elVerifyHint.textContent = "请先在上方计算背景测量建议，再从候选背景中选择一个复核";
+  } else {
+    elVerifyHint.textContent =
+      "沿用当前图层、旧样本、先后关系及建议容差（容差请在上方建议区修改后重算）";
+  }
+}
+
+function markVerifyStaleness() {
+  if (!verifyState.result) return;
+  const sig = verifySignature();
+  const fresh = sig === verifyState.resultKey || sig === verifyState.appendedSig;
+  verifyState.appended = verifyState.appended && fresh;
+  const old = elVerifyResult.querySelector(".stale-note");
+  if (!fresh && !old) {
+    const note = document.createElement("div");
+    note.className = "stale-note";
+    note.textContent = "参与复核的输入已变化（或已追加过样本），以下复核结果失效，请重新复核。";
+    elVerifyResult.prepend(note);
+  } else if (fresh && old) {
+    old.remove();
+  }
+}
+
+function verifyResultFresh() {
+  if (!verifyState.result) return false;
+  const sig = verifySignature();
+  return sig === verifyState.resultKey || sig === verifyState.appendedSig;
+}
+
+async function runVerify() {
+  if (!verifyState.background) return;
+  const payload = {
+    layers: state.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity })),
+    samples: state.samples.map((s) => ({ background: s.background, target: s.target })),
+    relations: state.relations.map((r) => ({ lower: r.lower, upper: r.upper })),
+    background: verifyState.background,
+    measuredTarget: verifyState.measured,
+    tolerance: suggestState.tolerance,
+    measurementBound: verifyState.bound,
+  };
+  elVerifyStatus.textContent = "复核中…";
+  elVerifyStatus.className = "status busy";
+  elVerifyErrors.hidden = true;
+
+  try {
+    const resp = await fetch("/api/verify-measurement", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    elVerifyStatus.textContent = "";
+    elVerifyStatus.className = "status";
+    if (!resp.ok) {
+      showVerifyErrors(data.errors || [{ scope: "form", message: "复核失败" }]);
+      return;
+    }
+    verifyState.result = data;
+    verifyState.resultKey = verifySignature();
+    verifyState.appendedSig = "";
+    verifyState.appended = false;
+    renderVerifyResult(data);
+  } catch (err) {
+    elVerifyStatus.textContent = "";
+    elVerifyStatus.className = "status";
+    showVerifyErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
+}
+
+function showVerifyErrors(errors) {
+  elVerifyErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elVerifyErrors.hidden = false;
+}
+
+function renderVerifyResult(r) {
+  const rows = r.orders
+    .map(
+      (o, k) => `
+        <div class="verify-order-row">
+          <span class="row-index">${k + 1}</span>
+          <span class="suggest-order-ids">${o.order.map(escapeHtml).join(" ↑ ")}</span>
+          <span class="swatch-mini" style="background:${o.predictedHex}"
+                title="预测 ${o.predictedHex} rgb(${o.predictedRgb
+        .map((v) => Math.round(v))
+        .join(", ")})"></span>
+          <span class="hexval">${o.predictedHex}</span>
+          <span class="verify-sse">新测量误差 <b>${fmtSse(o.measurementSse)}</b></span>
+          <span class="hint">旧总误差 ${fmtSse(o.totalSse)}</span>
+        </div>`
+    )
+    .join("");
+
+  let html = `
+    <div class="metric-row">
+      <span>复核背景：
+        <span class="mini" style="background:${r.background}"></span>
+        <b class="hexval">${r.background}</b>
+      </span>
+      <span>实测目标色：
+        <span class="mini" style="background:${r.measuredTarget}"></span>
+        <b class="hexval">${r.measuredTarget}</b>
+      </span>
+      <span>新测量上限：<b>${fmtSse(r.measurementBound)}</b></span>
+      <span>建议容差：<b>${fmtSse(r.tolerance)}</b></span>
+    </div>
+    <div class="metric-row">
+      <span>旧样本容差筛选前（可行叠序）：<b>${r.feasibleCount}</b> 条</span>
+      <span>容差筛选后：<b>${r.withinCount}</b> 条</span>
+      <span>再经新测量误差筛选：<b>${r.matchedCount}</b> 条</span>
+      <span>按新测量误差、旧总误差、ID 序列排序，展示前 <b>${r.orders.length}</b> 条（总数不受 12 条限制）</span>
+    </div>
+  `;
+
+  if (!r.compatible) {
+    html += `
+      <div class="suggest-none verify-none">
+        没有任何容差内叠序在该背景上的预测色满足新测量误差上限，
+        实测色 ${r.measuredTarget}（背景 ${r.background}）与现有候选不相容。
+      </div>`;
+    elVerifyResult.innerHTML = html;
+    return;
+  }
+
+  html += `<div class="suggest-orders verify-orders">${rows}</div>`;
+
+  const fresh = verifyResultFresh();
+  if (r.canAppendSample) {
+    html += `
+      <div class="verify-append-row">
+        <button class="btn btn-small" data-act="verify-append" type="button"
+                ${verifyState.appended || !fresh ? "disabled" : ""}>
+          把该测量追加为第 ${r.sampleCount + 1} 组样本并重新求解
+        </button>
+        <span class="hint">当前 ${r.sampleCount} / ${r.maxSamples} 组旧样本；追加后旧复核结果失效，需重新复核</span>
+      </div>`;
+  } else {
+    html += `
+      <div class="hint verify-append-row">
+        旧样本已达 ${r.maxSamples} 组上限，不能再追加测量为样本。
+      </div>`;
+  }
+  elVerifyResult.innerHTML = html;
+}
+
+function appendVerifySample() {
+  const r = verifyState.result;
+  if (!r || !r.canAppendSample) return;
+  if (!verifyResultFresh()) return; // 复核输入已变化，旧结果不能再用于追加
+  state.samples.push({ background: r.background, target: r.measuredTarget });
+  // 样本集合变化：旧建议与旧复核同时失效；记录追加时的指纹用于状态展示
+  verifyState.appended = true;
+  verifyState.appendedSig = verifySignature();
+  render();
+  renderVerifyResult(r);
+  const note = document.createElement("div");
+  note.className = "stale-note";
+  note.textContent = "该测量已追加为样本并触发重新求解；基于旧样本的本次复核结果失效，不能再次追加，请重新复核。";
+  elVerifyResult.prepend(note);
+  // 建议结果也基于旧样本，标记过期，防止误以为旧候选仍代表当前样本
+  markSuggestStaleness();
+  runSolve();
+}
+
 // ------------------------------------------------------------ 启动 --
 render();
 renderSuggestControls();
+updateVerifyRunHint();
 runSolve();

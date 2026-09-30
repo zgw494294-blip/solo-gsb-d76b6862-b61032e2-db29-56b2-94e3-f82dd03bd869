@@ -94,6 +94,40 @@
         </div>
       </div>
 
+      <!-- 实测复核 -->
+      <div class="card verify-card" id="verifyCard" hidden>
+        <div class="card-head">
+          <h2>实测复核 <span class="hint">（在选定候选背景上复核哪些叠序仍与实测相符）</span></h2>
+          <span id="verifyStatus" class="status"></span>
+        </div>
+        <div id="verifyBody">
+          <div class="infer-field">
+            <div class="infer-field-label">复核背景（从建议区候选背景中选择一个）</div>
+            <select id="verifyBgSelect" data-act="verify-bg"></select>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">实测目标色（在该背景上实际测得的颜色）</div>
+            <div class="verify-measure-row">
+              <input type="color" id="verifyPicker" data-act="verify-picker" value="#808080" title="选色" />
+              <input class="hex-input" id="verifyHex" data-act="verify-hex" type="text"
+                     value="#808080" placeholder="#RRGGBB" />
+            </div>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">新测量误差上限（非负有限；保留该背景上未取整 RGB 平方误差 ≤ 上限的叠序）</div>
+            <input id="verifyBound" data-act="verify-bound" type="number"
+                   min="0" step="any" value="25" />
+          </div>
+          <div class="infer-actions">
+            <button id="verifyRunBtn" class="btn btn-small" data-act="verify-run"
+                    type="button">按实测复核叠序</button>
+            <span id="verifyHint" class="hint">沿用当前图层、旧样本、先后关系及上方建议容差</span>
+          </div>
+          <div id="verifyErrors" class="infer-errors" hidden></div>
+          <div id="verifyResult"></div>
+        </div>
+      </div>
+
       <!-- 不透明度反推 -->
       <div class="card infer-card" id="inferCard" hidden>
         <div class="card-head">

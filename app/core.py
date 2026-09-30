@@ -7,6 +7,8 @@
 - 图层顺序确定后，可在 0.00～1.00（步长 0.01）网格上联合反推 1～2 个图层的不透明度
 - 下一次背景测量建议：保留总误差不高于最优总误差 + 容差的叠序，
   在候选背景上渲染后以「任意两条预测色未取整 RGB 平方距离最小值」打分并推荐
+- 实测复核：在选定候选背景上录入实测目标色与新测量误差上限，
+  在容差合规叠序中再按「该背景未取整 RGB 平方误差 ≤ 上限」过滤
 """
 
 from __future__ import annotations
@@ -363,6 +365,45 @@ def _sample_details(
     return results, total
 
 
+# --------------------------------------------------- 容差叠序枚举（共用） --
+
+
+def _parse_nonneg_finite(raw: Any, scope: str, label: str) -> tuple[float | None, dict[str, Any] | None]:
+    """校验「非负有限数字」。返回 (值, 错误)，二者恰有一个为 None。bool 视为非法。"""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        return None, _err(scope, f"{label}必须是非负有限的数字，实际为 {raw!r}")
+    if raw < 0:
+        return None, _err(scope, f"{label}不能为负：{raw}")
+    return float(raw), None
+
+
+def _enumerate_feasible_orders(
+    parsed: _Parsed,
+) -> tuple[list[tuple[float, tuple[str, ...], tuple[int, ...]]], float]:
+    """枚举全部满足先后关系的叠序，返回 [(旧总误差, ID 序列, 排列), ...] 与最优总误差。
+
+    复核必须在全部合规叠序上进行，不能只看建议页展示的前 12 条。
+    """
+    n = len(parsed.ids)
+    pairs = parsed.pairs
+
+    def feasible(perm: tuple[int, ...]) -> bool:
+        pos = [0] * n
+        for p, idx in enumerate(perm):
+            pos[idx] = p
+        return all(pos[li] < pos[ui] for li, ui in pairs)
+
+    evaluated: list[tuple[float, tuple[str, ...], tuple[int, ...]]] = []
+    best_sse = math.inf
+    for perm in itertools.permutations(range(n)):
+        if not feasible(perm):
+            continue
+        sse = _total_sse(parsed, list(perm), parsed.alphas)
+        best_sse = min(best_sse, sse)
+        evaluated.append((sse, tuple(parsed.ids[idx] for idx in perm), perm))
+    return evaluated, best_sse
+
+
 # ------------------------------------------------------------------- 求解 --
 
 
@@ -627,43 +668,35 @@ def suggest_background(payload: Any) -> dict[str, Any]:
 
     # ---- 误差容差 ----------------------------------------------------------
     raw_tol = payload.get("tolerance")
-    tolerance = 0.0
-    if isinstance(raw_tol, bool) or not isinstance(raw_tol, (int, float)) or not math.isfinite(raw_tol):
-        errors.append(_err("tolerance", f"误差容差必须是非负有限的数字，实际为 {raw_tol!r}"))
-    elif raw_tol < 0:
-        errors.append(_err("tolerance", f"误差容差不能为负：{raw_tol}"))
+    tolerance: float
+    tol_val, tol_err = _parse_nonneg_finite(raw_tol, "tolerance", "误差容差")
+    if tol_err is not None:
+        errors.append(tol_err)
+        tolerance = 0.0
     else:
-        tolerance = float(raw_tol)
+        assert tol_val is not None
+        tolerance = tol_val
 
     if errors:
         raise CalibrationError(errors)
     _raise_if_cycle(parsed)
 
-    n = len(parsed.ids)
-    pairs = parsed.pairs
-
-    def feasible(perm: tuple[int, ...]) -> bool:
-        pos = [0] * n
-        for p, idx in enumerate(perm):
-            pos[idx] = p
-        return all(pos[li] < pos[ui] for li, ui in pairs)
-
-    # ---- 枚举合规叠序，按容差保留 ------------------------------------------
-    evaluated: list[tuple[float, tuple[str, ...], tuple[int, ...]]] = []
-    best_sse = math.inf
-    for perm in itertools.permutations(range(n)):
-        if not feasible(perm):
-            continue
-        sse = _total_sse(parsed, list(perm), parsed.alphas)
-        best_sse = min(best_sse, sse)
-        evaluated.append((sse, tuple(parsed.ids[idx] for idx in perm), perm))
-
+    # ---- 枚举合规叠序，按容差保留（枚举全部，展示才截取前 12 条）----------
+    evaluated, best_sse_raw = _enumerate_feasible_orders(parsed)
     feasible_count = len(evaluated)
-    limit = best_sse + tolerance
+    limit = best_sse_raw + tolerance
     kept = [e for e in evaluated if e[0] <= limit]
     kept.sort(key=lambda e: (e[0], e[1]))
     within_count = len(kept)
     top = kept[:MAX_SUGGEST_ORDERS]
+
+    # 展示用总误差走 _sample_details 汇总，与 /api/solve 的 totalSse 逐位一致
+    best_display_perm = min(evaluated, key=lambda e: (e[0], e[1]))[2] if evaluated else None
+    best_display_sse = (
+        _sample_details(parsed, list(best_display_perm), parsed.alphas)[1]
+        if best_display_perm is not None
+        else best_sse_raw
+    )
 
     # 展示用总误差走 _sample_details 汇总，与 /api/solve 的 totalSse 逐位一致
     orders: list[dict[str, Any]] = []
@@ -679,7 +712,7 @@ def suggest_background(payload: Any) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "tolerance": tolerance,
-        "bestSse": orders[0]["totalSse"] if orders else best_sse,
+        "bestSse": best_display_sse,
         "feasibleCount": feasible_count,
         "withinCount": within_count,
         "orders": orders,
@@ -738,3 +771,134 @@ def suggest_background(payload: Any) -> dict[str, Any]:
 
     result["recommended"] = recommended
     return result
+
+
+# ------------------------------------------------------------- 实测复核 --
+
+
+def verify_measurement(payload: Any) -> dict[str, Any]:
+    """实测颜色复核。
+
+    沿用当前图层、旧样本与先后关系，以及建议阶段的容差：
+    1. 枚举全部合规叠序，保留旧样本总误差 ≤ 最优总误差 + 容差的全部顺序
+       （建议页只展示前 12 条，但复核必须覆盖其余叠序，不能漏）；
+    2. 在选定的候选背景上以未取整 0～255 RGB 渲染每条顺序，与实测目标色
+       计算平方误差，只保留不超过新测量误差上限者；
+    3. 按（新测量误差、旧总误差、ID 序列）排序，返回前 12 条，同时给出
+       过滤前/后的总数。无匹配时说明实测与现有候选不相容；有匹配且旧样本
+       不足 4 组时，可由调用方把该测量追加为样本并触发原求解。
+    """
+    parsed, errors = _parse_inputs(payload)
+    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
+
+    # ---- 选定的候选背景 ---------------------------------------------------
+    raw_background = payload.get("background")
+    bg_hex = "#000000"
+    bg_srgb: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    try:
+        bg_hex, bg_srgb = parse_hex(raw_background)
+    except ValueError:
+        errors.append(
+            _err(
+                "background",
+                f"复核背景色非法：需要形如 #RRGGBB 的 HEX 值，实际为 {raw_background!r}",
+            )
+        )
+
+    # ---- 实测目标色 -------------------------------------------------------
+    raw_measured = payload.get("measuredTarget")
+    measured_hex = "#000000"
+    measured_srgb: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    try:
+        measured_hex, measured_srgb = parse_hex(raw_measured)
+    except ValueError:
+        errors.append(
+            _err(
+                "measurement",
+                f"实测目标色非法：需要形如 #RRGGBB 的 HEX 值，实际为 {raw_measured!r}",
+            )
+        )
+
+    # ---- 容差（沿用建议阶段）与新测量误差上限 -----------------------------
+    raw_tol = payload.get("tolerance")
+    tolerance: float
+    tol_val, tol_err = _parse_nonneg_finite(raw_tol, "tolerance", "误差容差")
+    if tol_err is not None:
+        errors.append(tol_err)
+        tolerance = 0.0
+    else:
+        assert tol_val is not None
+        tolerance = tol_val
+
+    raw_bound = payload.get("measurementBound")
+    measurement_bound: float
+    bound_val, bound_err = _parse_nonneg_finite(raw_bound, "bound", "新测量误差上限")
+    if bound_err is not None:
+        errors.append(bound_err)
+        measurement_bound = 0.0
+    else:
+        assert bound_val is not None
+        measurement_bound = bound_val
+
+    if errors:
+        raise CalibrationError(errors)
+    _raise_if_cycle(parsed)
+
+    # ---- 第一步：旧样本容差筛选（全部合规叠序，不取前 12）----------------
+    evaluated, best_sse_raw = _enumerate_feasible_orders(parsed)
+    feasible_count = len(evaluated)
+    limit = best_sse_raw + tolerance
+    within = [e for e in evaluated if e[0] <= limit]
+    within.sort(key=lambda e: (e[0], e[1]))
+    within_count = len(within)
+
+    # 展示用旧总误差走 _sample_details 汇总，与 /api/solve 的 totalSse 逐位一致
+    best_perm = min(evaluated, key=lambda e: (e[0], e[1]))[2] if evaluated else None
+    best_sse = (
+        _sample_details(parsed, list(best_perm), parsed.alphas)[1]
+        if best_perm is not None
+        else best_sse_raw
+    )
+
+    # ---- 第二步：选定背景上的新测量误差筛选 -------------------------------
+    tgt255 = tuple(measured_srgb[c] * 255.0 for c in range(3))
+    matched: list[dict[str, Any]] = []
+    for _raw_sse, id_seq, perm in within:
+        pred = render_stack(bg_srgb, list(perm), parsed.lins, parsed.alphas)
+        pred255 = (pred[0] * 255.0, pred[1] * 255.0, pred[2] * 255.0)
+        new_sse = sum((pred255[c] - tgt255[c]) ** 2 for c in range(3))
+        if new_sse > measurement_bound:
+            continue
+        _, old_sse = _sample_details(parsed, list(perm), parsed.alphas)
+        rounded = [max(0, min(255, int(round(v)))) for v in pred255]
+        matched.append(
+            {
+                "order": list(id_seq),
+                "orderIndexes": list(perm),
+                "totalSse": old_sse,
+                "measurementSse": new_sse,
+                "predictedRgb": [pred255[0], pred255[1], pred255[2]],
+                "predictedHex": "#{:02x}{:02x}{:02x}".format(*rounded),
+            }
+        )
+
+    matched_count = len(matched)
+    # 按（新测量误差、旧总误差、ID 序列）排序；页面只取前 12，总数不受影响
+    matched.sort(key=lambda m: (m["measurementSse"], m["totalSse"], tuple(m["order"])))
+    orders = matched[:MAX_SUGGEST_ORDERS]
+
+    return {
+        "background": bg_hex,
+        "measuredTarget": measured_hex,
+        "tolerance": tolerance,
+        "measurementBound": measurement_bound,
+        "bestSse": best_sse,
+        "feasibleCount": feasible_count,
+        "withinCount": within_count,
+        "matchedCount": matched_count,
+        "sampleCount": len(parsed.bg_hex),
+        "maxSamples": MAX_SAMPLES,
+        "canAppendSample": matched_count > 0 and len(parsed.bg_hex) < MAX_SAMPLES,
+        "compatible": matched_count > 0,
+        "orders": orders,
+    }

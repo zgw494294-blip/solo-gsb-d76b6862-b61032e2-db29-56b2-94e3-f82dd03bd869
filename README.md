@@ -33,8 +33,9 @@ http://localhost:8000
 | 结果 | 最终顺序（带半透明色点、底→顶方向）、总平方误差、枚举/可行排列数；每个样本并排显示目标色与预测色、HEX、RGB 与 R/G/B 分通道平方误差 |
 | 不透明度反推 | 顺序确定后，沿用当前图层、样本与先后关系：确认一条底→顶顺序并勾选 1～2 个待调图层，其余图层保留原不透明度。联合遍历待调图层 0.00～1.00、步长 0.01 的全部组合（原始参数组若落在网格外也额外纳入），按同一未取整 RGB 平方误差总和选最优；同分时按 **ID 字典序排列的待调参数元组从小到大** 决胜。页面展示原值 / 建议值、调整前后总误差、每组样本的目标色与调整前后预测色，可一键把建议值写回图层并重新求解 |
 | 下一次背景测量建议 | 沿用当前图层、样本与先后关系，录入 **2～12 个**规范化后互不重复的候选背景 HEX 与**非负有限**的误差容差：枚举合规叠序，保留总误差 ≤ 最优总误差 ＋ 容差的顺序，按（总误差、ID 序列）排序取前 12 条展示，并给出符合容差的总数；在每个候选背景上按同一线性光规则渲染这些顺序，以**任意两条预测色未取整 RGB（0–255）平方距离的最小值**给背景打分，推荐得分最高者（同分取规范化 HEX 字典序最小者），并展示推荐背景上最难区分的一对顺序及其预测色；容差内不足两条顺序时提示无需追加测量 |
+| 实测复核 | 拿到推荐背景上的实测颜色后：从建议区候选背景中**选定一个背景**，录入**实测目标 HEX** 与**非负有限**的新测量误差上限。先沿用当前图层、旧样本、先后关系及建议容差，找出旧样本总误差 ≤ 最优总误差 ＋ 容差的**全部**合规叠序（不只是建议页前 12 条）；再在选定背景上以**未取整 0～255 RGB** 渲染并与实测色计算平方误差，只保留不超过新上限者。页面显示筛选前（可行数）/容差后/新测量筛选后的总数，以及留下叠序的旧总误差、新测量误差与预测色，按（新测量误差、旧总误差、ID 序列）排序展示前 12 条——**展示截断不影响计数与筛选，其余叠序不会漏**。无匹配时提示实测与现有候选不相容；有匹配且旧样本少于 4 组时，可一键把该测量追加为第 N 组样本并触发原求解 |
 
-输入任意改动后自动重新求解（带防抖），非法颜色、重复 ID、越界不透明度等错误会在页面顶部以中文逐条列出，并暂停计算。反推与背景建议为手动触发；输入变化后，旧结果会在卡片内标记为「可能过期」。
+输入任意改动后自动重新求解（带防抖），非法颜色、重复 ID、越界不透明度等错误会在页面顶部以中文逐条列出，并暂停计算。反推、背景建议与实测复核为手动触发；输入变化后，旧结果会在卡片内标记为「可能过期」。**参与复核的输入（图层、旧样本、先后关系、建议容差、选定背景、实测色、误差上限）一旦变化，复核结果立即失效；把测量追加为样本后，旧复核结果也失效且不能再用于追加**，需重新复核。
 
 ### 色彩与合成细节
 
@@ -215,6 +216,87 @@ curl -s -X POST http://localhost:8000/api/suggest-background \
 ] }
 ```
 
+## `POST /api/verify-measurement` — 实测复核
+
+在 `/api/solve` 请求体（`layers` / `samples` / `relations`，含义与校验完全沿用）的基础上增加四个字段：
+
+- `background`：选定的复核背景 HEX（通常取自 `/api/suggest-background` 返回的某个候选背景）；
+- `measuredTarget`：在该背景上实测得到的目标色 HEX（`#RGB` / `#RRGGBB`，`#` 可省略）；
+- `tolerance`：**非负有限**数字，沿用建议阶段的误差容差；
+- `measurementBound`：**非负有限**数字，新测量误差上限。
+
+服务端分两步筛选：
+
+1. 枚举全部满足先后关系的叠序，保留旧样本总误差 ≤ 最优总误差 ＋ `tolerance` 的**全部**顺序（不截取前 12）；
+2. 在选定背景上按同一线性光规则渲染每条顺序，与 `measuredTarget` 计算**未取整 0–255 RGB 平方误差**，只保留误差 ≤ `measurementBound` 者。
+
+留下的叠序按（新测量误差、旧总误差、ID 序列）排序，仅前 12 条放入 `orders`，但 `matchedCount` 是筛选后的真实总数。
+
+```bash
+curl -s -X POST http://localhost:8000/api/verify-measurement \
+  -H "Content-Type: application/json" \
+  -d '{
+    "layers": [
+      { "id": "R", "color": "#ff0000", "opacity": 0.5 },
+      { "id": "B", "color": "#0000ff", "opacity": 0.5 }
+    ],
+    "samples": [
+      { "background": "#ffffff", "target": "#e189bc" }
+    ],
+    "relations": [],
+    "background": "#000000",
+    "measuredTarget": "#bc0089",
+    "tolerance": 10000,
+    "measurementBound": 25
+  }'
+```
+
+成功返回（节选）：
+
+```json
+{
+  "background": "#000000",
+  "measuredTarget": "#bc0089",
+  "tolerance": 10000.0,
+  "measurementBound": 25.0,
+  "bestSse": 0.3876,
+  "feasibleCount": 2,
+  "withinCount": 2,
+  "matchedCount": 1,
+  "sampleCount": 1,
+  "maxSamples": 4,
+  "canAppendSample": true,
+  "compatible": true,
+  "orders": [
+    {
+      "order": ["B", "R"],
+      "orderIndexes": [1, 0],
+      "totalSse": 0.3876,
+      "measurementSse": 0.2358,
+      "predictedRgb": [187.52, 0.0, 136.96],
+      "predictedHex": "#bc0089"
+    }
+  ]
+}
+```
+
+说明：
+
+- `feasibleCount` → `withinCount` → `matchedCount` 依次为筛选前（可行叠序）、容差筛选后、新测量误差筛选后的数量；`orders` 只含排序后的前 12 条，计数与筛选始终覆盖全部叠序，不会漏。
+- `compatible` 为 `false`（即 `matchedCount = 0`）表示实测色与现有候选不相容——容差内没有任何叠序的预测色满足新上限。
+- `canAppendSample` 为 `true` 表示有匹配且旧样本少于 4 组；调用方可把 `{ "background": background, "target": measuredTarget }` 追加到 `samples` 后重新调用 `/api/solve`（页面上为一键操作）。追加后样本集合已变，本次复核结果失效、不能再用于追加。
+- 典型 400 报错（`scope` 为 `background` / `measurement` / `tolerance` / `bound`，其余校验错误沿用原 scope）：
+
+```json
+{ "errors": [
+  { "scope": "background",  "message": "复核背景色非法：需要形如 #RRGGBB 的 HEX 值，实际为 '#gg0000'" },
+  { "scope": "measurement", "message": "实测目标色非法：需要形如 #RRGGBB 的 HEX 值，实际为 123" },
+  { "scope": "tolerance",   "message": "误差容差必须是非负有限的数字，实际为 'abc'" },
+  { "scope": "bound",       "message": "新测量误差上限不能为负：-1" },
+  { "scope": "bound",       "message": "新测量误差上限必须是非负有限的数字，实际为 Infinity" }
+] }
+```
+
 ## 不用 Docker 的本地运行方式（可选）
 
 ```bash
@@ -232,8 +314,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 .
 ├── app/
 │   ├── __init__.py
-│   ├── core.py        # sRGB 转换 / alpha 合成 / 环检测 / 枚举择优 / 不透明度反推 / 背景测量建议（纯标准库）
-│   └── main.py        # FastAPI：/api/solve、/api/infer-opacity、/api/suggest-background 与静态页面托管
+│   ├── core.py        # sRGB 转换 / alpha 合成 / 环检测 / 枚举择优 / 不透明度反推 / 背景测量建议 / 实测复核（纯标准库）
+│   └── main.py        # FastAPI：/api/solve、/api/infer-opacity、/api/suggest-background、/api/verify-measurement 与静态页面托管
 ├── static/
 │   ├── index.html
 │   ├── styles.css
